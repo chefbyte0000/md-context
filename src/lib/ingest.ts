@@ -147,6 +147,31 @@ export function parseGithubUrl(input: string): GithubRef | null {
   }
 }
 
+interface TreeEntry {
+  path: string;
+  type: string; // "blob" | "tree" | "commit"
+  size?: number;
+  sha: string;
+}
+
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  limit: number,
+  fn: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let cursor = 0;
+  const workers = new Array(Math.min(limit, items.length)).fill(0).map(async () => {
+    while (true) {
+      const i = cursor++;
+      if (i >= items.length) return;
+      results[i] = await fn(items[i], i);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
 export async function ingestGithub(
   input: string,
   token: string | null,
@@ -163,15 +188,85 @@ export async function ingestGithub(
   if (!branch) {
     onProgress?.('Resolving default branch…');
     const r = await fetch(`https://api.github.com/repos/${ref.owner}/${ref.repo}`, { headers });
-    if (!r.ok) throw new Error(`GitHub API: ${r.status} ${r.statusText}`);
+    if (!r.ok) {
+      const msg = r.status === 404
+        ? `Repository ${ref.owner}/${ref.repo} not found (or private — add a token).`
+        : `GitHub API: ${r.status} ${r.statusText}`;
+      throw new Error(msg);
+    }
     const meta = await r.json();
     branch = meta.default_branch as string;
   }
 
-  onProgress?.(`Downloading ${ref.owner}/${ref.repo}@${branch}…`);
-  const zipUrl = `https://api.github.com/repos/${ref.owner}/${ref.repo}/zipball/${encodeURIComponent(branch)}`;
-  const zr = await fetch(zipUrl, { headers });
-  if (!zr.ok) throw new Error(`Failed to download archive: ${zr.status} ${zr.statusText}`);
-  const buf = new Uint8Array(await zr.arrayBuffer());
-  return ingestZip(buf, `${ref.owner}-${ref.repo}`, onProgress);
+  onProgress?.(`Listing files in ${ref.owner}/${ref.repo}@${branch}…`);
+  // The trees API supports CORS. zipball does not (it 302s to codeload, which only allows render.githubusercontent.com).
+  const treeUrl = `https://api.github.com/repos/${ref.owner}/${ref.repo}/git/trees/${encodeURIComponent(branch)}?recursive=1`;
+  const tr = await fetch(treeUrl, { headers });
+  if (!tr.ok) {
+    const msg = tr.status === 404
+      ? `Branch "${branch}" not found in ${ref.owner}/${ref.repo}.`
+      : `GitHub trees API: ${tr.status} ${tr.statusText}`;
+    throw new Error(msg);
+  }
+  const tree = await tr.json() as { tree: TreeEntry[]; truncated?: boolean };
+  if (tree.truncated) onProgress?.('Note: file tree was truncated by GitHub (very large repo).');
+
+  // Filter: only blobs we want to fetch (skip never-descend dirs).
+  const candidates = tree.tree.filter((e) => {
+    if (e.type !== 'blob') return false;
+    const parts = e.path.split('/');
+    if (shouldSkipPath(parts)) return false;
+    return true;
+  });
+
+  // Fetch via raw.githubusercontent.com — sends Access-Control-Allow-Origin: *.
+  // Auth: when a token is provided, route through the contents API with raw media type instead.
+  const useContentsApi = !!token; // contents API supports auth via header; raw.githubusercontent.com requires the token in URL which is fragile.
+  const total = candidates.length;
+  let done = 0;
+
+  const files = new Map<string, FileEntry>();
+  let packageJson: Record<string, unknown> | null = null;
+
+  await mapWithConcurrency(candidates, 8, async (entry) => {
+    const { path, size = 0 } = entry;
+    const isText = isTextPath(path) && size <= MAX_TEXT_BYTES;
+    if (!isText) {
+      files.set(path, { path, size, text: '', binary: true });
+      done++;
+      if (done % 25 === 0) onProgress?.(`Fetched ${done}/${total} files…`);
+      return;
+    }
+    let text = '';
+    let binary = false;
+    try {
+      const url = useContentsApi
+        ? `https://api.github.com/repos/${ref.owner}/${ref.repo}/contents/${encodeURI(path)}?ref=${encodeURIComponent(branch!)}`
+        : `https://raw.githubusercontent.com/${ref.owner}/${ref.repo}/${encodeURIComponent(branch!)}/${encodeURI(path)}`;
+      const reqHeaders = useContentsApi
+        ? { ...headers, Accept: 'application/vnd.github.raw' }
+        : undefined;
+      const fr = await fetch(url, reqHeaders ? { headers: reqHeaders } : undefined);
+      if (!fr.ok) {
+        binary = true;
+      } else {
+        const buf = new Uint8Array(await fr.arrayBuffer());
+        const decoded = decodeText(buf);
+        text = decoded.text;
+        binary = decoded.binary;
+      }
+    } catch {
+      binary = true;
+    }
+    files.set(path, { path, size, text, binary });
+    if (path === 'package.json' && !binary) {
+      try { packageJson = JSON.parse(text); } catch { /* ignore */ }
+    }
+    done++;
+    if (done % 25 === 0) onProgress?.(`Fetched ${done}/${total} files…`);
+  });
+
+  onProgress?.(`Indexed ${files.size} files`);
+  const projectType = detectProjectType(files, packageJson);
+  return { rootName: `${ref.owner}-${ref.repo}`, files, projectType, packageJson };
 }
